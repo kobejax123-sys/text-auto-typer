@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# PyInstaller 的产物
+build/
+dist/
+*.spec
