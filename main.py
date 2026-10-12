@@ -34,6 +34,7 @@ TRAY_CLOSE_LABEL = "最小化到托盘（后台继续运行）"  # 托盘不可�
 TRAY_SHOW = 1
 TRAY_QUIT = 2
 TRAY_ELEVATE = 3
+TRAY_TOGGLE = 4
 
 # 单实例用的互斥体名字
 MUTEX_NAME = "TextAutoTyper.SingleInstance"
@@ -111,8 +112,8 @@ def log(message):
     """往启动日志里追加一行。
 
     程序平时悄悄跑，偶发的问题（窗口没开到前台之类）又很难复现，留个流水账至少能
-    事后看清当时发生了什么：启动那会儿用户在用什么窗口、抢前台抢到没有。日志写不
-    进去就算了，绝不能因为它影响程序本身。
+    事后看清当时发生了什么：什么时候启动和退出、静默启动时是否在托盘待命、启动
+    那会儿用户在用什么窗口。日志写不进去就算了，绝不能因为它影响程序本身。
     """
     try:
         if os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
@@ -376,6 +377,7 @@ class App:
         self._hotkey_queue = queue.Queue()
         self._hotkey_map = {}
         self._enabled = True
+        self._tray_request = ""  # 托盘图标点了什么，见 _request_menu
 
         # 摆位置之前先别显示，否则能看见窗口从系统给的默认位置跳到屏幕中间
         root.withdraw()
@@ -399,7 +401,7 @@ class App:
 
         self.tray = winapi.TrayIcon(
             root, ICON_PATH, tooltip=APP_NAME,
-            on_activate=self._show_window, on_menu=self._tray_menu,
+            on_activate=self._request_show, on_menu=self._request_menu,
         )
         self.tray_ok = self.tray.active
         if not self.tray_ok:
@@ -473,6 +475,14 @@ class App:
         menubar.add_cascade(label="帮助(H)", menu=help_menu)
 
         root.config(menu=menubar)
+
+        # 全局开关摆在最显眼处：想临时让出这些按键时，不用再去翻“设置”菜单。
+        # 和菜单里那一项共用同一个变量，两边永远一致
+        toolbar = ttk.Frame(root)
+        toolbar.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Checkbutton(
+            toolbar, text="启用热键", variable=self.enabled_var, command=self._toggle_enabled
+        ).pack(side="left")
 
         table = ttk.Frame(root)
         table.pack(fill="both", expand=True, padx=8, pady=(8, 0))
@@ -628,9 +638,29 @@ class App:
             self._hotkey_queue.put(text)
         return True  # 吞掉这个键，避免同时传到当前程序
 
+    # -- 托盘点击：回调只记请求，动作留到轮询里做 --
+    def _request_show(self):
+        """托盘图标被左键双击。这里只记一笔。
+
+        本函数是在窗口过程回调里执行的（Tcl 的事件循环调进 Python），在这个上下文中
+        碰任何 Tk 命令——哪怕只是 root.after——回调返回时都会踩到解释器的线程状态，
+        Python 3.14 下直接是 fatal error、进程静默消失。所以只做纯 Python 赋值，
+        真正的活儿交给 _poll_hotkeys 去做。
+        """
+        self._tray_request = "show"
+
+    def _request_menu(self):
+        """托盘图标被右键。同上，只记一笔，菜单由轮询弹出。"""
+        self._tray_request = "menu"
+
     def _poll_hotkeys(self):
         if self._consume_show_request():
             self._show_window()
+        request, self._tray_request = self._tray_request, ""
+        if request == "show":
+            self._show_window()
+        elif request == "menu":
+            self._pop_tray_menu()
         while True:
             try:
                 text = self._hotkey_queue.get_nowait()
@@ -725,7 +755,8 @@ class App:
             "5. 如果目标程序以管理员身份运行，本程序也需提权（托盘右键「以管理员身份重启」），否则无法输入。\n"
             "6. 关闭窗口默认最小化到托盘，程序继续在后台响应热键。双击托盘图标可以重新打开窗口，"
             "右键托盘图标可以退出；想改成关闭即退出，见“设置 → 关闭窗口时”。\n"
-            "7. 需要临时让出这些按键时，在“设置”菜单里取消勾选“启用热键”。",
+            "7. 需要临时让出这些按键时，取消“启用热键”——主界面上方、设置菜单、"
+            "托盘右键里都有这一项，三处状态同步。",
             parent=self.root,
         )
 
@@ -767,17 +798,26 @@ class App:
         if winapi.foreground_window() != hwnd:
             winapi.force_foreground_window(hwnd)
 
-    def _tray_menu(self):
+    def _pop_tray_menu(self):
+        """弹出托盘右键菜单并执行选中的动作。由 _poll_hotkeys 调用，不在窗口过程里。"""
         choice = winapi.show_popup_menu(self.tray.hwnd, self._tray_items())
         if choice == TRAY_SHOW:
             self._show_window()
+        elif choice == TRAY_TOGGLE:
+            # 托盘里没有变量可点，先把状态翻过去，再走和主界面、设置菜单同一条路，
+            # 这样三处的勾选状态和 _enabled 永远一致
+            self.enabled_var.set(not self._enabled)
+            self._toggle_enabled()
         elif choice == TRAY_ELEVATE:
             self._relaunch_elevated()
         elif choice == TRAY_QUIT:
             self._quit()
 
     def _tray_items(self):
-        items = [(TRAY_SHOW, "显示主窗口")]
+        items = [
+            (TRAY_SHOW, "显示主窗口"),
+            (TRAY_TOGGLE, "启用热键", self._enabled),
+        ]
         # 已经是管理员权限就不再显示提权项，免得用户以为还没提
         if not winapi.is_elevated():
             items.append((TRAY_ELEVATE, "以管理员身份重启"))

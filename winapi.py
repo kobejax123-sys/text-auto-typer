@@ -62,6 +62,7 @@ SM_CYSCREEN = 1
 SPI_GETWORKAREA = 0x0030
 
 MF_STRING = 0x0000
+MF_CHECKED = 0x0008
 TPM_RIGHTBUTTON = 0x0002
 TPM_RETURNCMD = 0x0100
 
@@ -561,15 +562,19 @@ class KeyboardHook:
 def show_popup_menu(hwnd, items):
     """在鼠标位置弹出右键菜单，返回被点中项的 id，没选中返回 0。
 
-    items 是 [(id, 文字), ...]。弹出前必须先把这个窗口设为前台，
+    items 是 [(id, 文字)] 或 [(id, 文字, 是否勾选)]。弹出前必须先把这个窗口设为前台，
     否则菜单在点击别处时不会消失。
     """
     menu = user32.CreatePopupMenu()
     if not menu:
         return 0
     try:
-        for item_id, label in items:
-            user32.AppendMenuW(menu, MF_STRING, item_id, label)
+        for item in items:
+            item_id, label = item[0], item[1]
+            flags = MF_STRING
+            if len(item) > 2 and item[2]:
+                flags |= MF_CHECKED
+            user32.AppendMenuW(menu, flags, item_id, label)
         point = POINT()
         user32.GetCursorPos(ctypes.byref(point))
         user32.SetForegroundWindow(hwnd)
