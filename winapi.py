@@ -46,12 +46,14 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
 
 NIM_ADD = 0
+NIM_MODIFY = 1
 NIM_DELETE = 2
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
 NIF_TIP = 0x04
 WM_TRAYICON = WM_APP + 1  # 托盘图标把鼠标事件发到这个自定义消息
 TRAY_ICON_ID = 1
+MSGFLT_ALLOW = 1          # ChangeWindowMessageFilterEx：允许低权限进程发来该消息
 IDI_APPLICATION = 32512   # 系统默认程序图标，图标文件读不出来时兜底
 
 IMAGE_ICON = 1
@@ -266,6 +268,14 @@ user32.DestroyMenu.argtypes = (wintypes.HMENU,)
 user32.DestroyMenu.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = (wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW))
 shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+user32.RegisterWindowMessageW.argtypes = (wintypes.LPCWSTR,)
+user32.RegisterWindowMessageW.restype = wintypes.UINT
+_ChangeWindowMessageFilterEx = getattr(user32, "ChangeWindowMessageFilterEx", None)
+if _ChangeWindowMessageFilterEx is not None:
+    _ChangeWindowMessageFilterEx.argtypes = (
+        wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p
+    )
+    _ChangeWindowMessageFilterEx.restype = wintypes.BOOL
 
 kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
 kernel32.CreateMutexW.restype = wintypes.HANDLE
@@ -591,8 +601,9 @@ def show_popup_menu(hwnd, items):
 class TrayIcon:
     """系统托盘图标。
 
-    实现方式是子类化宿主窗口的窗口过程来接收托盘消息，因此回调都在 Tk 主线程里执行，
-    可以直接操作界面，不需要额外的线程和队列。
+    实现方式是子类化宿主窗口的窗口过程来接收托盘消息，因此回调都在 Tk 主线程里执行。
+    同时监听系统广播的 TaskbarCreated 消息（并在提权时放行该消息），配合定期校验，
+    防止 explorer.exe 重启或开机任务栏尚未就绪导致托盘图标丢失。
     """
 
     def __init__(self, tk_widget, icon_path, tooltip="", on_activate=None, on_menu=None):
@@ -602,22 +613,49 @@ class TrayIcon:
         self._proc = WNDPROC(self._wnd_proc)  # 必须留引用，否则回调被回收
         self._old_proc = None
         self._active = False
+        self._closed = False
+        self._needs_restore = False
+        self._taskbar_event = False
+        self._last_check = time.monotonic()
 
+        # explorer.exe 重启后会向所有顶层窗口广播这个消息，要求各程序重加托盘图标。
+        # 本程序以管理员权限运行时，普通权限的 explorer.exe 发来的消息会被 UIPI 拦截，
+        # 必须显式放行，否则提权状态下依然收不到。
+        self._msg_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        if self._msg_taskbar_created and _ChangeWindowMessageFilterEx is not None:
+            _ChangeWindowMessageFilterEx(
+                self._hwnd, self._msg_taskbar_created, MSGFLT_ALLOW, None
+            )
+
+        tip = tooltip[:127]
         self._data = NOTIFYICONDATAW()
         self._data.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._data.hWnd = self._hwnd
         self._data.uID = TRAY_ICON_ID
         self._data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self._data.uCallbackMessage = WM_TRAYICON
-        self._data.szTip = tooltip[:127]
+        self._data.szTip = tip
         self._data.hIcon = self._load_icon(icon_path)
+
+        # 轻量校验用：只带 NIF_TIP 调 NIM_MODIFY，既能确认图标仍在托盘里，又不重绘图标
+        self._probe = NOTIFYICONDATAW()
+        self._probe.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        self._probe.hWnd = self._hwnd
+        self._probe.uID = TRAY_ICON_ID
+        self._probe.uFlags = NIF_TIP
+        self._probe.szTip = tip
 
         self._old_proc = _SetWindowLongPtrW(
             self._hwnd, GWL_WNDPROC, ctypes.cast(self._proc, ctypes.c_void_p)
         )
+        if not self._old_proc:
+            self._closed = True
+            return
         self._active = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data)))
         if not self._active:
-            self._restore_proc()
+            # 首次添加失败（常见于开机自启时任务栏还没起来）时不撤销窗口过程，
+            # 留着继续接 TaskbarCreated，并在后续轮询里重试。
+            self._needs_restore = True
 
     @property
     def active(self):
@@ -628,7 +666,47 @@ class TrayIcon:
         """宿主窗口句柄，弹托盘菜单时要传给 TrackPopupMenu。"""
         return self._hwnd
 
+    def ensure(self, retry_interval=2.0, check_interval=5.0):
+        """检查托盘图标是否还在；丢失或之前未创建成功时自动重新添加。
+
+        返回值：
+          None       —— 未到检查/重试时间（或已关闭），本次未做任何系统调用
+          "ok"       —— 图标正常存在
+          "restored" —— 图标刚重新添加到托盘
+          "failed"   —— 图标不存在且本次重建失败，稍后会继续重试
+        """
+        if self._closed:
+            return None
+        now = time.monotonic()
+        if self._needs_restore:
+            # 刚收到 TaskbarCreated 时立刻尝试重建；否则按 retry_interval 节流重试
+            if self._taskbar_event:
+                self._taskbar_event = False
+            elif now - self._last_check < retry_interval:
+                return None
+        else:
+            if now - self._last_check < check_interval:
+                return None
+
+        self._last_check = now
+        # 先用 NIM_MODIFY 校验：能防重复的 TaskbarCreated 导致 NIM_ADD 误报失败，
+        # 也能在没收到 TaskbarCreated 的静默丢失场景下发现图标已不在托盘里。
+        if shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(self._probe)):
+            self._active = True
+            self._needs_restore = False
+            return "ok"
+
+        if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data)):
+            self._active = True
+            self._needs_restore = False
+            return "restored"
+
+        self._active = False
+        self._needs_restore = True
+        return "failed"
+
     def close(self):
+        self._closed = True
         if self._active:
             shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data))
             self._active = False
@@ -660,6 +738,10 @@ class TrayIcon:
                 if self._on_menu:
                     self._on_menu()
             return 0
+        if self._msg_taskbar_created and msg == self._msg_taskbar_created:
+            # 只记标志，不在这里直接调 Shell_NotifyIconW 或碰 Tk，交由主循环轮询处理
+            self._needs_restore = True
+            self._taskbar_event = True
         # 其余消息一律交回 Tk 原来的窗口过程，否则界面会失灵
         return user32.CallWindowProcW(self._old_proc, hwnd, msg, wparam, lparam)
 

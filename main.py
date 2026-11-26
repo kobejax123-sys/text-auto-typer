@@ -403,16 +403,10 @@ class App:
             root, ICON_PATH, tooltip=APP_NAME,
             on_activate=self._request_show, on_menu=self._request_menu,
         )
-        self.tray_ok = self.tray.active
+        self._set_tray_available(self.tray.active)
         if not self.tray_ok:
-            # 没有托盘图标，窗口一旦收起来就再也叫不回来，所以强制降级成关闭即退出，
-            # 并把那个菜单项置灰，免得用户以为还能最小化。只改运行时状态，
-            # self.close_action 保持用户原来的选择，这样配置不会被写坏。
-            self.close_menu.entryconfig(
-                self.close_menu.index(TRAY_CLOSE_LABEL), state="disabled"
-            )
-            self.close_action_var.set(CLOSE_QUIT)
-            self._status("托盘图标创建失败，关闭窗口时将直接退出")
+            log("托盘图标初始创建失败，将在后台继续重试")
+            self._status("托盘图标暂未就绪，将在后台重试；当前关闭窗口将直接退出")
 
         if self.config_warning:
             messagebox.showwarning(APP_NAME, self.config_warning, parent=root)
@@ -654,6 +648,7 @@ class App:
         self._tray_request = "menu"
 
     def _poll_hotkeys(self):
+        self._maintain_tray()
         if self._consume_show_request():
             self._show_window()
         request, self._tray_request = self._tray_request, ""
@@ -668,6 +663,34 @@ class App:
                 break
             self._inject(text)
         self.root.after(POLL_MS, self._poll_hotkeys)
+
+    def _set_tray_available(self, available):
+        """同步托盘可用状态到“关闭窗口时”菜单项。
+
+        没有托盘图标时，窗口一旦收起来就再也叫不回来，所以临时降级成关闭即退出，
+        并把“最小化到托盘”置灰；等图标恢复后再还原。只改运行时状态，不改动
+        self.close_action，用户保存的配置不会被写坏。
+        """
+        self.tray_ok = available
+        self.close_menu.entryconfig(
+            self.close_menu.index(TRAY_CLOSE_LABEL),
+            state="normal" if available else "disabled",
+        )
+        self.close_action_var.set(self.close_action if available else CLOSE_QUIT)
+
+    def _maintain_tray(self):
+        """在任务栏重启或开机延迟就绪后自动补回托盘图标。"""
+        if not self.tray:
+            return
+        result = self.tray.ensure()
+        if result == "restored":
+            log("托盘图标已恢复")
+            if not self.tray_ok:
+                self._set_tray_available(True)
+                self._status("托盘图标已恢复")
+        elif result == "failed" and self.tray_ok:
+            log("检测到托盘图标丢失且重建失败，将继续重试")
+            self._set_tray_available(False)
 
     def _consume_show_request(self):
         """吃掉别的实例留下的「亮窗」信号（见 request_show）。"""
